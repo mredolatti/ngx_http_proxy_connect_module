@@ -13,6 +13,11 @@
     "HTTP/1.1 200 Connection Established\r\n"   \
     "Proxy-agent: nginx\r\n\r\n"
 
+#define NGX_HTTP_PROXY_CONNECT_CHAIN_REQ_1 "CONNECT "
+#define NGX_HTTP_PROXY_CONNECT_CHAIN_REQ_2 " HTTP/1.1\r\n\r\nHost: "
+#define NGX_HTTP_PROXY_CONNECT_CHAIN_REQ_3 "\r\n\r\n"
+#define NGX_HTTP_PROXY_CONNECT_CHAIN_BUFFER_SIZE 1024
+
 
 typedef struct ngx_http_proxy_connect_upstream_s
     ngx_http_proxy_connect_upstream_t;
@@ -39,6 +44,7 @@ typedef struct {
     ngx_http_proxy_connect_address_t    *local;
 
     ngx_http_complex_value_t            *response;
+    ngx_http_complex_value_t            *proxy_chain;
 } ngx_http_proxy_connect_loc_conf_t;
 
 
@@ -97,12 +103,20 @@ typedef struct {
     ngx_flag_t                      send_established;
     ngx_flag_t                      send_established_done;
 
-    ngx_buf_t                       buf;    /* CONNECT response */
+    ngx_buf_t                       response_buf;    /* CONNECT response */
 
     ngx_msec_t                      connect_timeout;
     ngx_msec_t                      send_timeout;
     ngx_msec_t                      data_timeout;
 
+    enum {
+        NGX_HTTP_PROXY_CONNECT_CHAIN_SENDING,
+        NGX_HTTP_PROXY_CONNECT_CHAIN_READING,
+        NGX_HTTP_PROXY_CONNECT_CHAIN_DONE
+    }                               proxy_chain_status;
+    ngx_str_t                       proxy_chain_host;
+    ngx_buf_t                       proxy_chain_incoming;
+    ngx_buf_t                       proxy_chain_outgoing;
 } ngx_http_proxy_connect_ctx_t;
 
 
@@ -145,7 +159,10 @@ static ngx_int_t ngx_http_proxy_connect_sock_ntop(ngx_http_request_t *r,
     ngx_http_proxy_connect_upstream_t *u);
 static ngx_int_t ngx_http_proxy_connect_create_peer(ngx_http_request_t *r,
     ngx_http_upstream_resolved_t *ur);
-
+static void ngx_http_proxy_connect_conn_established_handler(ngx_http_request_t* r);
+static void ngx_http_proxy_connect_chain_connect(ngx_http_request_t* r);
+static void
+ngx_http_proxy_connect_chain_callback(ngx_http_request_t* r, ngx_http_proxy_connect_upstream_t* u);
 
 
 static ngx_command_t  ngx_http_proxy_connect_commands[] = {
@@ -218,6 +235,13 @@ static ngx_command_t  ngx_http_proxy_connect_commands[] = {
       ngx_http_set_complex_value_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_proxy_connect_loc_conf_t, response),
+      NULL },
+
+    { ngx_string("proxy_connect_chain_proxy"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_http_set_complex_value_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_connect_loc_conf_t, proxy_chain),
       NULL },
 
     ngx_null_command
@@ -300,7 +324,7 @@ static ngx_http_variable_t  ngx_http_proxy_connect_vars[] = {
     { ngx_string("proxy_connect_response"),
       ngx_http_proxy_connect_variable_set_response,
       ngx_http_proxy_connect_variable_get_response,
-      offsetof(ngx_http_proxy_connect_ctx_t, buf),
+      offsetof(ngx_http_proxy_connect_ctx_t, response_buf),
       NGX_HTTP_VAR_NOCACHEABLE|NGX_HTTP_VAR_CHANGEABLE, 0 },
 
     { ngx_null_string, NULL, NULL, 0, 0, 0 }
@@ -556,7 +580,7 @@ ngx_http_proxy_connect_send_connection_established(ngx_http_request_t *r)
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
-    b = &ctx->buf;
+    b = &ctx->response_buf;
 
     /* modify CONNECT response via proxy_connect_response directive */
     {
@@ -945,7 +969,7 @@ ngx_http_proxy_connect_write_upstream(ngx_http_request_t *r,
     }
 
     if (!ctx->send_established) {
-        ngx_http_proxy_connect_send_connection_established(r);
+        ngx_http_proxy_connect_conn_established_handler(r);
         return;
     }
 
@@ -984,8 +1008,8 @@ ngx_http_proxy_connect_send_handler(ngx_http_request_t *r)
         return;
     }
 
-    if (ctx->buf.pos != ctx->buf.last) {
-        ngx_http_proxy_connect_send_connection_established(r);
+    if (ctx->response_buf.pos != ctx->response_buf.last) {
+        ngx_http_proxy_connect_conn_established_handler(r);
     }
 }
 
@@ -1118,7 +1142,7 @@ ngx_http_proxy_connect_process_connect(ngx_http_request_t *r,
         return;
     }
 
-    ngx_http_proxy_connect_send_connection_established(r);
+    ngx_http_proxy_connect_conn_established_handler(r);
 }
 
 
@@ -1489,7 +1513,11 @@ ngx_http_proxy_connect_handler(ngx_http_request_t *r)
 
     ngx_memzero(&url, sizeof(ngx_url_t));
 
-    if (plcf->address) {
+    if (plcf->proxy_chain) {
+        if (ngx_http_complex_value(r, plcf->proxy_chain, &url.url) != NGX_OK) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+    } else if (plcf->address) {
         if (ngx_http_complex_value(r, plcf->address, &url.url) != NGX_OK) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
@@ -1498,7 +1526,6 @@ ngx_http_proxy_connect_handler(ngx_http_request_t *r)
             url.url.len = r->connect_host.len;
             url.url.data = r->connect_host.data;
         }
-
     } else {
         url.url.len = r->connect_host.len;
         url.url.data = r->connect_host.data;
@@ -2283,8 +2310,8 @@ ngx_http_proxy_connect_variable_get_response(ngx_http_request_t *r,
         return NGX_OK;
     }
 
-    v->data = ctx->buf.pos;
-    v->len = ctx->buf.last - ctx->buf.pos;
+    v->data = ctx->response_buf.pos;
+    v->len = ctx->response_buf.last - ctx->response_buf.pos;
 
     return NGX_OK;
 }
@@ -2306,8 +2333,8 @@ ngx_http_proxy_connect_variable_set_response(ngx_http_request_t *r,
         return;
     }
 
-    ctx->buf.pos = (u_char *) v->data;
-    ctx->buf.last = ctx->buf.pos + v->len;
+    ctx->response_buf.pos = (u_char *) v->data;
+    ctx->response_buf.last = ctx->response_buf.pos + v->len;
 }
 
 static ngx_int_t
@@ -2351,10 +2378,10 @@ ngx_http_proxy_connect_post_read_handler(ngx_http_request_t *r)
             return NGX_ERROR;
         }
 
-        ctx->buf.pos = (u_char *) NGX_HTTP_PROXY_CONNECT_ESTABLISTHED;
-        ctx->buf.last = ctx->buf.pos +
+        ctx->response_buf.pos = (u_char *) NGX_HTTP_PROXY_CONNECT_ESTABLISTHED;
+        ctx->response_buf.last = ctx->response_buf.pos +
                         sizeof(NGX_HTTP_PROXY_CONNECT_ESTABLISTHED) - 1;
-        ctx->buf.memory = 1;
+        ctx->response_buf.memory = 1;
 
         ctx->connect_timeout = pclcf->connect_timeout;
         ctx->send_timeout = pclcf->send_timeout;
@@ -2383,4 +2410,156 @@ ngx_http_proxy_connect_init(ngx_conf_t *cf)
     *h = ngx_http_proxy_connect_post_read_handler;
 
     return NGX_OK;
+}
+
+static void
+ngx_http_proxy_connect_conn_established_handler(ngx_http_request_t* r)
+{
+    ngx_http_proxy_connect_loc_conf_t *pclcf = ngx_http_get_module_loc_conf(r, ngx_http_proxy_connect_module);
+    if (!pclcf->proxy_chain) {
+        ngx_http_proxy_connect_send_connection_established(r);
+        return;
+    }
+    ngx_http_proxy_connect_chain_connect(r);
+}
+
+static void
+ngx_http_proxy_connect_chain_connect(ngx_http_request_t* r)
+{
+    ngx_http_proxy_connect_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_connect_module);
+    ctx->proxy_chain_outgoing.start = ngx_palloc(r->pool, NGX_HTTP_PROXY_CONNECT_CHAIN_BUFFER_SIZE);
+    if (ctx->proxy_chain_outgoing.start == NULL) {
+        // TODO(mredolatti): PROPER Error handling
+        abort();
+    }
+    ctx->proxy_chain_outgoing.pos = ctx->proxy_chain_outgoing.start;
+    ctx->proxy_chain_outgoing.end = ctx->proxy_chain_outgoing.start + NGX_HTTP_PROXY_CONNECT_CHAIN_BUFFER_SIZE;
+    ctx->proxy_chain_outgoing.last = ngx_snprintf(ctx->proxy_chain_outgoing.start,
+                 ctx->proxy_chain_outgoing.end - ctx->proxy_chain_outgoing.start, 
+                 "CONNECT %V:%V HTTP/1.1\r\nHost: %V:%V\r\n\r\n",
+                &r->connect_host, &r->connect_port,
+                &r->connect_host, &r->connect_port);
+    ctx->proxy_chain_outgoing.temporary = 1;
+    ctx->proxy_chain_outgoing.last_buf = 1;
+
+    ctx->proxy_chain_incoming.start = ngx_palloc(r->pool, NGX_HTTP_PROXY_CONNECT_CHAIN_BUFFER_SIZE /* TODO(mredolatti) */);
+    if (ctx->proxy_chain_incoming.start == NULL) {
+        // TODO(mredolatti): PROPER Error handling
+        abort();
+    }
+    ctx->proxy_chain_incoming.pos = ctx->proxy_chain_incoming.start;
+    ctx->proxy_chain_incoming.last = ctx->proxy_chain_incoming.start;
+    ctx->proxy_chain_incoming.end = ctx->proxy_chain_incoming.start + NGX_HTTP_PROXY_CONNECT_CHAIN_BUFFER_SIZE;
+    ctx->proxy_chain_incoming.temporary = 1;
+    ctx->proxy_chain_incoming.last_buf = 1;
+
+    ctx->u->read_event_handler = ngx_http_proxy_connect_chain_callback;
+    ctx->u->write_event_handler = ngx_http_proxy_connect_chain_callback;
+    ctx->proxy_chain_status = NGX_HTTP_PROXY_CONNECT_CHAIN_SENDING;
+
+    // manually invoke callback to start sending...
+    ngx_http_proxy_connect_chain_callback(r, ctx->u);
+}
+
+static void
+ngx_http_proxy_connect_chain_callback(ngx_http_request_t* r, ngx_http_proxy_connect_upstream_t* u)
+{
+
+    ngx_http_proxy_connect_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_connect_module);
+    ngx_connection_t* uc = ctx->u->peer.connection;
+
+    size_t write_size = ctx->proxy_chain_outgoing.last - ctx->proxy_chain_outgoing.pos;
+    switch (ctx->proxy_chain_status) {
+    case NGX_HTTP_PROXY_CONNECT_CHAIN_SENDING:
+        // write CONNECT request (if not done yet and able to do so)
+        if (write_size && uc->write->ready) {
+            uc->log->action = "forwarding CONNECT request to next proxy in chain";
+
+            ngx_int_t n = uc->send(uc, ctx->proxy_chain_outgoing.pos, write_size);
+            if (n == NGX_AGAIN) {
+                return;
+            }
+
+            if (n == NGX_ERROR) {
+                ngx_http_proxy_connect_finalize_request(r, ctx->u, NGX_ERROR);
+                return;
+            }
+
+            if (n > 0) {
+                ctx->proxy_chain_outgoing.pos += n;
+                if (ctx->proxy_chain_outgoing.pos == ctx->proxy_chain_outgoing.last) {
+                    ctx->proxy_chain_outgoing.pos = ctx->proxy_chain_outgoing.start;
+                    ctx->proxy_chain_outgoing.last = ctx->proxy_chain_outgoing.start;
+                    ctx->proxy_chain_status = NGX_HTTP_PROXY_CONNECT_CHAIN_READING;
+                }
+            }
+        }
+        break;
+
+    case NGX_HTTP_PROXY_CONNECT_CHAIN_READING:
+        // read CONNECT response (if able todo so)
+        if (uc->read->ready) {
+
+            uc->log->action = "reading forwarded CONNECT response from next proxy in chain";
+
+            ngx_int_t n = uc->recv(uc, ctx->proxy_chain_incoming.last, ctx->proxy_chain_incoming.end - ctx->proxy_chain_incoming.start);
+            if (n == NGX_AGAIN || n == 0) {
+                return;
+            }
+
+            if (n == NGX_ERROR) {
+                uc->read->eof = 1;
+
+                // TODO(mredolatti): revisar esto
+                if (ngx_errno != EOF) {
+                    ngx_http_proxy_connect_finalize_request(r, ctx->u, NGX_ERROR);
+                    return;
+                }
+            }
+
+            if (n > 0) {
+                ctx->proxy_chain_incoming.last += n;
+            }
+
+            ngx_http_status_t status;
+            ngx_memzero(&status, sizeof(ngx_http_status_t));
+            ngx_int_t rc = ngx_http_parse_status_line(r, &ctx->proxy_chain_incoming, &status);
+            if (rc == NGX_ERROR) {
+                // TODO(mredolatti): handle error properly
+                abort();
+            } else if (rc == NGX_AGAIN) {
+                // request line still incomplete
+                // TODO(mredolatti): check if we need to issue an extra read so that an event gets registered
+                return; 
+            } else if (rc == NGX_OK) {
+                if (status.code != 200) {
+                    // TODO(mredolatti): handle properly
+                    abort();
+                }
+
+                ctx->proxy_chain_status = NGX_HTTP_PROXY_CONNECT_CHAIN_DONE;
+
+                uc->write->handler = ngx_http_proxy_connect_upstream_handler;
+                uc->read->handler = ngx_http_proxy_connect_upstream_handler;
+
+                ctx->u->write_event_handler = ngx_http_proxy_connect_write_upstream;
+                ctx->u->read_event_handler = ngx_http_proxy_connect_read_upstream;
+
+                uc->sendfile &= r->connection->sendfile;
+                uc->log = r->connection->log;
+
+                ngx_http_proxy_connect_send_connection_established(r);
+                return;
+
+            }
+
+            // TODO(mredolatti): y ahora?
+            abort();
+
+        }
+        break;
+    
+    case NGX_HTTP_PROXY_CONNECT_CHAIN_DONE:
+        // should not enter here
+    }
 }
