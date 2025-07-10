@@ -13,11 +13,7 @@
     "HTTP/1.1 200 Connection Established\r\n"   \
     "Proxy-agent: nginx\r\n\r\n"
 
-#define NGX_HTTP_PROXY_CONNECT_CHAIN_REQ_1 "CONNECT "
-#define NGX_HTTP_PROXY_CONNECT_CHAIN_REQ_2 " HTTP/1.1\r\n\r\nHost: "
-#define NGX_HTTP_PROXY_CONNECT_CHAIN_REQ_3 "\r\n\r\n"
 #define NGX_HTTP_PROXY_CONNECT_CHAIN_BUFFER_SIZE 1024
-
 
 typedef struct ngx_http_proxy_connect_upstream_s
     ngx_http_proxy_connect_upstream_t;
@@ -45,6 +41,8 @@ typedef struct {
 
     ngx_http_complex_value_t            *response;
     ngx_http_complex_value_t            *proxy_chain;
+
+    ngx_ssl_t*                          ssl;
 } ngx_http_proxy_connect_loc_conf_t;
 
 
@@ -87,6 +85,8 @@ struct ngx_http_proxy_connect_upstream_s {
     ngx_msec_t                                     start_time;
 
     ngx_http_proxy_connect_upstream_state_t        state;
+
+    // TODO(mredolatti) see if this is the best way to foward the io event
 };
 
 struct ngx_http_proxy_connect_address_s {
@@ -117,6 +117,7 @@ typedef struct {
     ngx_str_t                       proxy_chain_host;
     ngx_buf_t                       proxy_chain_incoming;
     ngx_buf_t                       proxy_chain_outgoing;
+    u_char                          ssl_in_progress;
 } ngx_http_proxy_connect_ctx_t;
 
 
@@ -163,7 +164,12 @@ static void ngx_http_proxy_connect_conn_established_handler(ngx_http_request_t* 
 static void ngx_http_proxy_connect_chain_connect(ngx_http_request_t* r);
 static void
 ngx_http_proxy_connect_chain_callback(ngx_http_request_t* r, ngx_http_proxy_connect_upstream_t* u);
-
+static char*
+ngx_http_proxy_connect_chain_ssl_setup(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static void ngx_proxy_connect_establish_ssl_tunnel(ngx_http_request_t* r);
+static void ngx_proxy_connect_ssl_handshake_handler(ngx_connection_t *c);
+static void
+ngx_http_proxy_connect_temporary_ssl_ev_handler(ngx_event_t *ev);
 
 static ngx_command_t  ngx_http_proxy_connect_commands[] = {
 
@@ -242,6 +248,13 @@ static ngx_command_t  ngx_http_proxy_connect_commands[] = {
       ngx_http_set_complex_value_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_proxy_connect_loc_conf_t, proxy_chain),
+      NULL },
+
+    { ngx_string("proxy_connect_chain_proxy_ssl"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_NOARGS,
+      ngx_http_proxy_connect_chain_ssl_setup,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_connect_loc_conf_t, ssl),
       NULL },
 
     ngx_null_command
@@ -920,6 +933,9 @@ ngx_http_proxy_connect_read_upstream(ngx_http_request_t *r,
     }
 
     if (!ctx->send_established_done) {
+        if (ctx->ssl_in_progress) { // ngx_ssl_handshake already calls this
+            //return;
+        }
         if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
             ngx_http_proxy_connect_finalize_request(r, u,
                                                NGX_HTTP_INTERNAL_SERVER_ERROR);
@@ -974,6 +990,9 @@ ngx_http_proxy_connect_write_upstream(ngx_http_request_t *r,
     }
 
     if (!ctx->send_established_done) {
+        if (ctx->ssl_in_progress) { // ngx_ssl_handshake already calls this
+            //return;
+        }
         if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
             ngx_http_proxy_connect_finalize_request(r, u,
                                                NGX_HTTP_INTERNAL_SERVER_ERROR);
@@ -2387,6 +2406,8 @@ ngx_http_proxy_connect_post_read_handler(ngx_http_request_t *r)
         ctx->send_timeout = pclcf->send_timeout;
         ctx->data_timeout = pclcf->data_timeout;
 
+        ctx->ssl_in_progress = 0;
+
         ngx_http_set_ctx(r, ctx, ngx_http_proxy_connect_module);
     }
 
@@ -2420,7 +2441,64 @@ ngx_http_proxy_connect_conn_established_handler(ngx_http_request_t* r)
         ngx_http_proxy_connect_send_connection_established(r);
         return;
     }
+    if (pclcf->ssl) {
+        ngx_proxy_connect_establish_ssl_tunnel(r);
+        return;
+    }
     ngx_http_proxy_connect_chain_connect(r);
+}
+
+// TODO(mredolatti): this should be void, since it it's not a handler itself
+static void ngx_proxy_connect_establish_ssl_tunnel(ngx_http_request_t* r)
+{
+    ngx_http_proxy_connect_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_connect_module);
+    ngx_connection_t* uc = ctx->u->peer.connection;
+
+    ngx_http_proxy_connect_loc_conf_t *pclcf = ngx_http_get_module_loc_conf(r, ngx_http_proxy_connect_module);
+    if (ngx_ssl_create_connection(pclcf->ssl, uc, NGX_SSL_BUFFER | NGX_SSL_CLIENT) != NGX_OK) {
+        ngx_http_proxy_connect_finalize_request(r, ctx->u, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    ngx_int_t rc = ngx_ssl_handshake(uc);
+    if (rc == NGX_ERROR) {
+        // TODO(mredolatti): proper error handling
+        ngx_http_proxy_connect_finalize_request(r, ctx->u, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    if (rc == NGX_AGAIN) {
+
+        if (!uc->write->timer_set) {
+            ngx_add_timer(uc->write, pclcf->connect_timeout);
+        }
+
+        uc->ssl->handler = ngx_proxy_connect_ssl_handshake_handler;
+        ctx->ssl_in_progress = 1;
+        return;
+    }
+
+    ngx_proxy_connect_ssl_handshake_handler(uc);
+}
+
+static void ngx_proxy_connect_ssl_handshake_handler(ngx_connection_t *c)
+{
+    if (c->ssl->handshaked) {
+        ngx_http_proxy_connect_upstream_t* u =  c->data;
+        ngx_http_request_t* r = u->request;
+
+        ngx_http_proxy_connect_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_connect_module);
+        ctx->ssl_in_progress = 0;
+
+        c->write->handler = ngx_http_proxy_connect_upstream_handler;
+        c->read->handler = ngx_http_proxy_connect_upstream_handler;
+        ngx_http_proxy_connect_chain_connect(r);
+
+        return;
+    }
+
+    //TODO(mredolatti): proper error handling
+    abort();
 }
 
 static void
@@ -2563,3 +2641,27 @@ ngx_http_proxy_connect_chain_callback(ngx_http_request_t* r, ngx_http_proxy_conn
         // should not enter here
     }
 }
+
+static char*
+ngx_http_proxy_connect_chain_ssl_setup(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_proxy_connect_loc_conf_t *plcf = conf;
+
+    // TODO(mredolatti): make this configurable
+    ngx_uint_t ssl_protocols = (NGX_CONF_BITMASK_SET
+                                  |NGX_SSL_TLSv1|NGX_SSL_TLSv1_1
+                                  |NGX_SSL_TLSv1_2|NGX_SSL_TLSv1_3);
+
+    plcf->ssl = ngx_pcalloc(cf->pool, sizeof(ngx_ssl_t));
+    if (plcf->ssl == NULL) {
+        // TODO(mredolatti): handle properly
+        abort();
+    }
+    if (ngx_ssl_create(plcf->ssl, ssl_protocols, NULL) != NGX_OK) {
+        // TODO(mredolatti): handle properly
+        return NGX_CONF_ERROR;
+    }
+    return NGX_CONF_OK;
+}
+
+
