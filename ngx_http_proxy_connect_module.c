@@ -13,6 +13,7 @@
     "HTTP/1.1 200 Connection Established\r\n"   \
     "Proxy-agent: nginx\r\n\r\n"
 
+#define NGX_HTTP_PROXY_CONNECT_CHAIN_BUFFER_SIZE 1024
 
 typedef struct ngx_http_proxy_connect_upstream_s
     ngx_http_proxy_connect_upstream_t;
@@ -39,6 +40,20 @@ typedef struct {
     ngx_http_proxy_connect_address_t    *local;
 
     ngx_http_complex_value_t            *response;
+
+    ngx_http_complex_value_t            *proxy_chain;
+#if (NGX_HTTP_SSL)
+    ngx_ssl_t*                          proxy_chain_ssl;
+    ngx_http_complex_value_t*           proxy_chain_ssl_root_ca;
+    union {
+        struct fields {
+            unsigned proxy_chain_ssl_enable:1;
+            unsigned proxy_chain_ssl_verify_upstream:1;
+        } fields;
+        ngx_uint_t flags;
+    };
+#endif
+
 } ngx_http_proxy_connect_loc_conf_t;
 
 
@@ -97,12 +112,22 @@ typedef struct {
     ngx_flag_t                      send_established;
     ngx_flag_t                      send_established_done;
 
-    ngx_buf_t                       buf;    /* CONNECT response */
+    ngx_buf_t                       response_buf;    /* CONNECT response */
 
     ngx_msec_t                      connect_timeout;
     ngx_msec_t                      send_timeout;
     ngx_msec_t                      data_timeout;
 
+    enum {
+        NGX_HTTP_PROXY_CONNECT_CHAIN_SENDING_REQ,
+        NGX_HTTP_PROXY_CONNECT_CHAIN_READING_SL,
+        NGX_HTTP_PROXY_CONNECT_CHAIN_READING_HEADERS,
+        NGX_HTTP_PROXY_CONNECT_CHAIN_DONE
+    }                               proxy_chain_status;
+    ngx_str_t                       proxy_chain_host;
+    ngx_buf_t                       proxy_chain_incoming;
+    ngx_buf_t                       proxy_chain_outgoing;
+    ngx_http_status_t               proxy_chain_status_line;
 } ngx_http_proxy_connect_ctx_t;
 
 
@@ -145,8 +170,19 @@ static ngx_int_t ngx_http_proxy_connect_sock_ntop(ngx_http_request_t *r,
     ngx_http_proxy_connect_upstream_t *u);
 static ngx_int_t ngx_http_proxy_connect_create_peer(ngx_http_request_t *r,
     ngx_http_upstream_resolved_t *ur);
-
-
+static void ngx_http_proxy_connect_conn_established_handler(ngx_http_request_t* r);
+static void ngx_http_proxy_connect_chain_connect(ngx_http_request_t* r);
+static void
+ngx_http_proxy_connect_chain_callback(ngx_http_request_t* r, ngx_http_proxy_connect_upstream_t* u);
+static u_char* ngx_http_proxy_connect_next_lb(u_char* start, u_char* end);
+#if (NGX_HTTP_SSL)
+static char*
+ngx_http_proxy_connect_chain_ssl_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char*
+ngx_http_proxy_connect_chain_ssl_verify_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static void ngx_proxy_connect_establish_ssl_tunnel(ngx_http_request_t* r);
+static void ngx_proxy_connect_ssl_handshake_handler(ngx_connection_t *c);
+#endif
 
 static ngx_command_t  ngx_http_proxy_connect_commands[] = {
 
@@ -219,6 +255,36 @@ static ngx_command_t  ngx_http_proxy_connect_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_proxy_connect_loc_conf_t, response),
       NULL },
+
+    { ngx_string("proxy_connect_chain_proxy"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_http_set_complex_value_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_connect_loc_conf_t, proxy_chain),
+      NULL },
+
+#if (NGX_HTTP_SSL)
+    { ngx_string("proxy_connect_chain_proxy_ssl"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_NOARGS,
+      ngx_http_proxy_connect_chain_ssl_enable,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_connect_loc_conf_t, proxy_chain_ssl),
+      NULL },
+
+    { ngx_string("proxy_connect_chain_proxy_ssl_verify"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_NOARGS,
+      ngx_http_proxy_connect_chain_ssl_verify_enable,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_connect_loc_conf_t, fields),
+      NULL },
+
+    { ngx_string("proxy_connect_chain_proxy_ssl_verify_cert"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_http_set_complex_value_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_connect_loc_conf_t, proxy_chain_ssl_root_ca),
+      NULL },
+#endif
 
     ngx_null_command
 };
@@ -300,7 +366,7 @@ static ngx_http_variable_t  ngx_http_proxy_connect_vars[] = {
     { ngx_string("proxy_connect_response"),
       ngx_http_proxy_connect_variable_set_response,
       ngx_http_proxy_connect_variable_get_response,
-      offsetof(ngx_http_proxy_connect_ctx_t, buf),
+      offsetof(ngx_http_proxy_connect_ctx_t, response_buf),
       NGX_HTTP_VAR_NOCACHEABLE|NGX_HTTP_VAR_CHANGEABLE, 0 },
 
     { ngx_null_string, NULL, NULL, 0, 0, 0 }
@@ -495,7 +561,15 @@ ngx_http_proxy_connect_finalize_request(ngx_http_request_t *r,
         u->peer.sockaddr = NULL;
     }
 
+
     if (u->peer.connection) {
+
+#if (NGX_HTTP_SSL)
+        if (u->peer.connection->ssl) {
+            u->peer.connection->ssl->no_wait_shutdown = 1;
+            (void) ngx_ssl_shutdown(u->peer.connection);
+        }
+#endif
 
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "proxy_connect: close upstream connection: %d",
@@ -556,7 +630,7 @@ ngx_http_proxy_connect_send_connection_established(ngx_http_request_t *r)
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
-    b = &ctx->buf;
+    b = &ctx->response_buf;
 
     /* modify CONNECT response via proxy_connect_response directive */
     {
@@ -945,7 +1019,7 @@ ngx_http_proxy_connect_write_upstream(ngx_http_request_t *r,
     }
 
     if (!ctx->send_established) {
-        ngx_http_proxy_connect_send_connection_established(r);
+        ngx_http_proxy_connect_conn_established_handler(r);
         return;
     }
 
@@ -984,8 +1058,8 @@ ngx_http_proxy_connect_send_handler(ngx_http_request_t *r)
         return;
     }
 
-    if (ctx->buf.pos != ctx->buf.last) {
-        ngx_http_proxy_connect_send_connection_established(r);
+    if (ctx->response_buf.pos != ctx->response_buf.last) {
+        ngx_http_proxy_connect_conn_established_handler(r);
     }
 }
 
@@ -1118,7 +1192,7 @@ ngx_http_proxy_connect_process_connect(ngx_http_request_t *r,
         return;
     }
 
-    ngx_http_proxy_connect_send_connection_established(r);
+    ngx_http_proxy_connect_conn_established_handler(r);
 }
 
 
@@ -1489,7 +1563,11 @@ ngx_http_proxy_connect_handler(ngx_http_request_t *r)
 
     ngx_memzero(&url, sizeof(ngx_url_t));
 
-    if (plcf->address) {
+    if (plcf->proxy_chain) {
+        if (ngx_http_complex_value(r, plcf->proxy_chain, &url.url) != NGX_OK) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+    } else if (plcf->address) {
         if (ngx_http_complex_value(r, plcf->address, &url.url) != NGX_OK) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
@@ -1498,7 +1576,6 @@ ngx_http_proxy_connect_handler(ngx_http_request_t *r)
             url.url.len = r->connect_host.len;
             url.url.data = r->connect_host.data;
         }
-
     } else {
         url.url.len = r->connect_host.len;
         url.url.data = r->connect_host.data;
@@ -1978,6 +2055,46 @@ ngx_http_proxy_connect_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_ptr_value(conf->local, prev->local, NULL);
 
+    if (conf->fields.proxy_chain_ssl_enable) {
+        // TODO(mredolatti): make this configurable
+        ngx_uint_t ssl_protocols = (NGX_CONF_BITMASK_SET
+                                      |NGX_SSL_TLSv1|NGX_SSL_TLSv1_1
+                                      |NGX_SSL_TLSv1_2|NGX_SSL_TLSv1_3);
+
+        conf->proxy_chain_ssl = ngx_pcalloc(cf->pool, sizeof(ngx_ssl_t));
+        if (conf->proxy_chain_ssl == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        if (ngx_ssl_create(conf->proxy_chain_ssl, ssl_protocols, NULL) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+
+        ngx_pool_cleanup_t  *cln = ngx_pool_cleanup_add(cf->pool, 0);
+        if (cln == NULL) {
+            ngx_ssl_cleanup_ctx(conf->proxy_chain_ssl);
+            return NGX_CONF_ERROR;
+        }
+        cln->handler = ngx_ssl_cleanup_ctx;
+        cln->data = conf->proxy_chain_ssl;
+
+
+        if (conf->fields.proxy_chain_ssl_verify_upstream) {
+            if (conf->proxy_chain_ssl_root_ca->value.len == 0) {
+                ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                          "no proxy_ssl_trusted_certificate for proxy_ssl_verify");
+                return NGX_CONF_ERROR;
+            }
+
+            if (ngx_ssl_trusted_certificate(cf, conf->proxy_chain_ssl,
+                                            &conf->proxy_chain_ssl_root_ca->value,
+                                            2)
+                != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+        }
+
+    }
     return NGX_CONF_OK;
 }
 
@@ -2283,8 +2400,8 @@ ngx_http_proxy_connect_variable_get_response(ngx_http_request_t *r,
         return NGX_OK;
     }
 
-    v->data = ctx->buf.pos;
-    v->len = ctx->buf.last - ctx->buf.pos;
+    v->data = ctx->response_buf.pos;
+    v->len = ctx->response_buf.last - ctx->response_buf.pos;
 
     return NGX_OK;
 }
@@ -2306,8 +2423,8 @@ ngx_http_proxy_connect_variable_set_response(ngx_http_request_t *r,
         return;
     }
 
-    ctx->buf.pos = (u_char *) v->data;
-    ctx->buf.last = ctx->buf.pos + v->len;
+    ctx->response_buf.pos = (u_char *) v->data;
+    ctx->response_buf.last = ctx->response_buf.pos + v->len;
 }
 
 static ngx_int_t
@@ -2351,10 +2468,10 @@ ngx_http_proxy_connect_post_read_handler(ngx_http_request_t *r)
             return NGX_ERROR;
         }
 
-        ctx->buf.pos = (u_char *) NGX_HTTP_PROXY_CONNECT_ESTABLISTHED;
-        ctx->buf.last = ctx->buf.pos +
+        ctx->response_buf.pos = (u_char *) NGX_HTTP_PROXY_CONNECT_ESTABLISTHED;
+        ctx->response_buf.last = ctx->response_buf.pos +
                         sizeof(NGX_HTTP_PROXY_CONNECT_ESTABLISTHED) - 1;
-        ctx->buf.memory = 1;
+        ctx->response_buf.memory = 1;
 
         ctx->connect_timeout = pclcf->connect_timeout;
         ctx->send_timeout = pclcf->send_timeout;
@@ -2384,3 +2501,303 @@ ngx_http_proxy_connect_init(ngx_conf_t *cf)
 
     return NGX_OK;
 }
+
+static void
+ngx_http_proxy_connect_conn_established_handler(ngx_http_request_t* r)
+{
+    ngx_http_proxy_connect_loc_conf_t *pclcf = ngx_http_get_module_loc_conf(r, ngx_http_proxy_connect_module);
+    if (!pclcf->proxy_chain) {
+        ngx_http_proxy_connect_send_connection_established(r);
+        return;
+    }
+
+#if (NGX_HTTP_SSL)
+    if (pclcf->proxy_chain_ssl) {
+        ngx_proxy_connect_establish_ssl_tunnel(r);
+        return;
+    }
+#endif
+    ngx_http_proxy_connect_chain_connect(r);
+}
+
+#if (NGX_HTTP_SSL)
+static void ngx_proxy_connect_establish_ssl_tunnel(ngx_http_request_t* r)
+{
+    ngx_http_proxy_connect_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_connect_module);
+    ngx_connection_t* uc = ctx->u->peer.connection;
+
+    ngx_http_proxy_connect_loc_conf_t *pclcf = ngx_http_get_module_loc_conf(r, ngx_http_proxy_connect_module);
+    if (ngx_ssl_create_connection(pclcf->proxy_chain_ssl, uc, NGX_SSL_BUFFER | NGX_SSL_CLIENT) != NGX_OK) {
+        ngx_http_proxy_connect_finalize_request(r, ctx->u, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    ngx_int_t rc = ngx_ssl_handshake(uc);
+    if (rc == NGX_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+              "failed to initiate ssl handshake");
+        ngx_http_proxy_connect_finalize_request(r, ctx->u, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    if (rc == NGX_AGAIN) {
+
+        if (!uc->write->timer_set) {
+            ngx_add_timer(uc->write, pclcf->connect_timeout);
+        }
+
+        uc->ssl->handler = ngx_proxy_connect_ssl_handshake_handler;
+        return;
+    }
+
+    ngx_proxy_connect_ssl_handshake_handler(uc);
+}
+
+static void ngx_proxy_connect_ssl_handshake_handler(ngx_connection_t *c)
+{
+    ngx_http_proxy_connect_upstream_t* u =  c->data;
+    ngx_http_request_t* r = u->request;
+    if (c->ssl->handshaked) {
+        ngx_http_proxy_connect_loc_conf_t *pclcf = ngx_http_get_module_loc_conf(r, ngx_http_proxy_connect_module);
+        //ngx_http_proxy_connect_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_connect_module);
+
+        if (pclcf->fields.proxy_chain_ssl_verify_upstream) {
+            ngx_int_t rc = SSL_get_verify_result(c->ssl->connection);
+            if (rc != X509_V_OK) {
+                ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                              "upstream SSL certificate verify error: (%l:%s)",
+                              rc, X509_verify_cert_error_string(rc));
+                abort();
+            }
+        }
+
+        /* 
+         * TODO!
+        if (ngx_ssl_check_host(c, &r->connect_host) != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "upstream SSL certificate does not match \"%V\"",
+                          &r->connect_host);
+            abort();
+        }
+        */
+
+        c->write->handler = ngx_http_proxy_connect_upstream_handler;
+        c->read->handler = ngx_http_proxy_connect_upstream_handler;
+        ngx_http_proxy_connect_chain_connect(r);
+        return;
+    }
+
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+        "handshake routine finished unsuccessfully");
+    ngx_http_proxy_connect_finalize_request(r, u, NGX_ERROR);
+}
+#endif
+
+static void
+ngx_http_proxy_connect_chain_connect(ngx_http_request_t* r)
+{
+    ngx_http_proxy_connect_upstream_t* u =  r->connection->data;
+    ngx_http_proxy_connect_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_connect_module);
+    ctx->proxy_chain_outgoing.start = ngx_palloc(r->pool, NGX_HTTP_PROXY_CONNECT_CHAIN_BUFFER_SIZE);
+    if (ctx->proxy_chain_outgoing.start == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "failed to allocate chained proxy outgoing buffer");
+        ngx_http_proxy_connect_finalize_request(r, u, NGX_ERROR);
+        return;
+    }
+    ctx->proxy_chain_outgoing.pos = ctx->proxy_chain_outgoing.start;
+    ctx->proxy_chain_outgoing.end = ctx->proxy_chain_outgoing.start + NGX_HTTP_PROXY_CONNECT_CHAIN_BUFFER_SIZE;
+    ctx->proxy_chain_outgoing.last = ngx_snprintf(ctx->proxy_chain_outgoing.start,
+                 ctx->proxy_chain_outgoing.end - ctx->proxy_chain_outgoing.start, 
+                 "CONNECT %V:%V HTTP/1.1\r\nHost: %V:%V\r\n\r\n",
+                &r->connect_host, &r->connect_port,
+                &r->connect_host, &r->connect_port);
+    ctx->proxy_chain_outgoing.temporary = 1;
+    ctx->proxy_chain_outgoing.last_buf = 1;
+
+    ctx->proxy_chain_incoming.start = ngx_palloc(r->pool, NGX_HTTP_PROXY_CONNECT_CHAIN_BUFFER_SIZE*100 /* TODO(mredolatti) */);
+    if (ctx->proxy_chain_incoming.start == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "failed to allocate chained proxy incoming buffer");
+        ngx_http_proxy_connect_finalize_request(r, u, NGX_ERROR);
+        return;
+    }
+    ctx->proxy_chain_incoming.pos = ctx->proxy_chain_incoming.start;
+    ctx->proxy_chain_incoming.last = ctx->proxy_chain_incoming.start;
+    ctx->proxy_chain_incoming.end = ctx->proxy_chain_incoming.start + NGX_HTTP_PROXY_CONNECT_CHAIN_BUFFER_SIZE*100;
+    ctx->proxy_chain_incoming.temporary = 1;
+    ctx->proxy_chain_incoming.last_buf = 1;
+
+    ctx->u->read_event_handler = ngx_http_proxy_connect_chain_callback;
+    ctx->u->write_event_handler = ngx_http_proxy_connect_chain_callback;
+    ctx->proxy_chain_status = NGX_HTTP_PROXY_CONNECT_CHAIN_SENDING_REQ;
+
+    // manually invoke callback to start sending...
+    ngx_http_proxy_connect_chain_callback(r, ctx->u);
+}
+
+static void
+ngx_http_proxy_connect_chain_callback(ngx_http_request_t* r, ngx_http_proxy_connect_upstream_t* u)
+{
+
+    ngx_http_proxy_connect_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_connect_module);
+    ngx_connection_t* uc = ctx->u->peer.connection;
+
+    size_t write_size = ctx->proxy_chain_outgoing.last - ctx->proxy_chain_outgoing.pos;
+    switch (ctx->proxy_chain_status) {
+    case NGX_HTTP_PROXY_CONNECT_CHAIN_SENDING_REQ:
+        // write CONNECT request (if not done yet and able to do so)
+        if (write_size && uc->write->ready) {
+            uc->log->action = "forwarding CONNECT request to next proxy in chain";
+
+            ngx_int_t n = uc->send(uc, ctx->proxy_chain_outgoing.pos, write_size);
+            if (n == NGX_AGAIN) {
+                return;
+            }
+
+            if (n == NGX_ERROR) {
+                ngx_http_proxy_connect_finalize_request(r, ctx->u, NGX_ERROR);
+                return;
+            }
+
+            if (n > 0) {
+                ctx->proxy_chain_outgoing.pos += n;
+                if (ctx->proxy_chain_outgoing.pos == ctx->proxy_chain_outgoing.last) {
+                    ctx->proxy_chain_outgoing.pos = ctx->proxy_chain_outgoing.start;
+                    ctx->proxy_chain_outgoing.last = ctx->proxy_chain_outgoing.start;
+                    ctx->proxy_chain_status = NGX_HTTP_PROXY_CONNECT_CHAIN_READING_SL;
+                }
+            }
+        }
+        break;
+
+    case NGX_HTTP_PROXY_CONNECT_CHAIN_READING_SL:
+        // read CONNECT response (if able todo so)
+        if (!uc->read->ready) {
+            break;
+        }
+
+        uc->log->action = "reading forwarded CONNECT response from next proxy in chain";
+
+        ngx_int_t n = uc->recv(uc, ctx->proxy_chain_incoming.last, ctx->proxy_chain_incoming.end - ctx->proxy_chain_incoming.last);
+        if (n == NGX_AGAIN || n == 0) {
+            return;
+        }
+
+        if (n == NGX_ERROR) {
+            uc->read->eof = 1;
+
+            // TODO(mredolatti): revisar esto
+            if (ngx_errno != EOF) {
+                ngx_http_proxy_connect_finalize_request(r, ctx->u, NGX_ERROR);
+                return;
+            }
+        }
+
+        if (n > 0) {
+            ctx->proxy_chain_incoming.last += n;
+        }
+
+        // TODO(mredolatti):
+        // This code has grown horrible needs quite a bit of polishing, but should work for most cases
+        // except if a SUCCESSFUL response's status line + its headers are larger than a buffer size of 5k
+        // neither this module, nor tinyproxy nor squid returns ANY header upon successful connection establishing
+        // but still...
+        ngx_memzero(&ctx->proxy_chain_status_line, sizeof(ngx_http_status_t));
+        ngx_int_t rc = ngx_http_parse_status_line(r, &ctx->proxy_chain_incoming, &ctx->proxy_chain_status_line);
+        if (rc == NGX_ERROR) {
+            ngx_log_error(NGX_LOG_ERR, uc->log, 0,
+                "failed to parse chained proxy response's status line");
+            ngx_http_proxy_connect_finalize_request(r, u, NGX_ERROR);
+            return;
+        } else if (rc == NGX_AGAIN) { // request line still incomplete
+            return; 
+        } else if (rc == NGX_OK) {
+            if (ctx->proxy_chain_status_line.code != 200) {
+                ngx_log_error(NGX_LOG_ERR, uc->log, 0,
+                    "chained CONNECT request returned %d", ctx->proxy_chain_status_line.code);
+                ngx_http_proxy_connect_finalize_request(r, u, NGX_ERROR);
+                return;
+            }
+            ctx->proxy_chain_status = NGX_HTTP_PROXY_CONNECT_CHAIN_READING_HEADERS;
+        } else {
+            ngx_log_error(NGX_LOG_ERR, uc->log, 0,
+                "unexpected rc when parsing status line %d", rc);
+            ngx_http_proxy_connect_finalize_request(r, u, NGX_ERROR);
+            return;
+        }
+    case NGX_HTTP_PROXY_CONNECT_CHAIN_READING_HEADERS:
+        for (;;) {
+            u_char* newLine = ngx_http_proxy_connect_next_lb(ctx->proxy_chain_incoming.pos, ctx->proxy_chain_incoming.last);
+            if (newLine == NULL) {
+                ngx_int_t n = uc->recv(uc, ctx->proxy_chain_incoming.last, ctx->proxy_chain_incoming.end - ctx->proxy_chain_incoming.last);
+                if (n == NGX_AGAIN || n == 0) {
+                    return;
+                } else if (n == NGX_ERROR) {
+                    uc->read->eof = 1;
+
+                    // TODO(mredolatti): revisar esto
+                    if (ngx_errno != EOF) {
+                        ngx_http_proxy_connect_finalize_request(r, ctx->u, NGX_ERROR);
+                        return;
+                    }
+                } else if (n > 0) {
+                    ctx->proxy_chain_incoming.last += n;
+                    continue;
+                }
+
+            } else if (newLine != ctx->proxy_chain_incoming.pos) {
+                // we have headers we want to skip
+                ctx->proxy_chain_incoming.pos = newLine + 2;
+                continue;
+            } else { // headers read!
+                ctx->proxy_chain_status = NGX_HTTP_PROXY_CONNECT_CHAIN_DONE;
+                break;
+            }
+        }
+    case NGX_HTTP_PROXY_CONNECT_CHAIN_DONE:
+        uc->write->handler = ngx_http_proxy_connect_upstream_handler;
+        uc->read->handler = ngx_http_proxy_connect_upstream_handler;
+
+        ctx->u->write_event_handler = ngx_http_proxy_connect_write_upstream;
+        ctx->u->read_event_handler = ngx_http_proxy_connect_read_upstream;
+
+        uc->sendfile &= r->connection->sendfile;
+        uc->log = r->connection->log;
+
+        ngx_http_proxy_connect_send_connection_established(r);
+        return;
+
+    }
+}
+
+#if (NGX_HTTP_SSL)
+static char*
+ngx_http_proxy_connect_chain_ssl_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_proxy_connect_loc_conf_t *plcf = conf;
+    plcf->fields.proxy_chain_ssl_enable = 1;
+    return NGX_CONF_OK;
+
+}
+
+static char*
+ngx_http_proxy_connect_chain_ssl_verify_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_proxy_connect_loc_conf_t *plcf = conf;
+    plcf->fields.proxy_chain_ssl_verify_upstream = 1;
+    return NGX_CONF_OK;
+}
+#endif
+
+static u_char* ngx_http_proxy_connect_next_lb(u_char* start, u_char* end)
+{
+    while (start + 1 < end) {
+        if (*start == '\r' && *(start+1) == '\n') {
+            return start;
+        }
+        start++;
+    }
+    return NULL;
+}
+
